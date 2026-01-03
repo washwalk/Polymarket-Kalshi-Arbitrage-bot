@@ -48,10 +48,13 @@ This document provides coding guidelines and commands for agents working on the 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
+use teloxide::prelude::*;
+use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
-use crate::types::{PriceCents, SizeCents};
+use crate::types::{AlertMessage, PositionSummary, PriceCents, SizeCents, StatusCache};
 use crate::cache::TeamCache;
 ```
 
@@ -159,15 +162,30 @@ mod tests {
 ```
 
 ### Concurrency and Safety
-- Use `Arc<RwLock<T>>` for shared mutable state
+- Use `Arc<RwLock<T>>` for shared mutable state when needed
+- Use `Arc<ArcSwap<T>>` for lock-free status caches (StatusCache pattern)
+- Use `tokio::sync::broadcast` for shutdown signals across all tasks
+- Use `mpsc::channel` for non-blocking notification queues
 - Prefer atomic operations over locks when possible
 - Use `tokio::spawn` for async tasks
-- Handle cancellation properly in async functions
+- Handle cancellation properly in async functions with `tokio::select!`
 - Example:
 ```rust
-let state = Arc::new(RwLock::new(GlobalState::new()));
+// Status cache for lock-free reads
+let status_cache = Arc::new(ArcSwap::new(Arc::new(PositionSummary::default())));
+
+// Broadcast shutdown
+let (shutdown_tx, _) = broadcast::channel(1);
+
+// Notification channel
+let (alert_tx, alert_rx) = mpsc::unbounded_channel();
+
+// Task with shutdown handling
 tokio::spawn(async move {
-    // Task implementation
+    tokio::select! {
+        result = task_logic() => { /* handle result */ }
+        _ = shutdown_rx.recv() => { /* cleanup and exit */ }
+    }
 });
 ```
 
@@ -190,11 +208,20 @@ error!("[KALSHI] WebSocket error: {}", e);
 - Example module structure:
 ```
 src/
-├── main.rs          # Application entry point
-├── types.rs         # Core types and data structures
-├── execution.rs     # Order execution logic
-├── kalshi.rs        # Kalshi platform integration
-└── polymarket.rs    # Polymarket platform integration
+├── main.rs              # Application entry point and orchestration
+├── types.rs             # Core types, status cache, and alert messages
+├── execution.rs         # Order execution with alerts and cache updates
+├── position_tracker.rs # Position tracking and P&L calculation
+├── circuit_breaker.rs   # Risk management and limits
+├── discovery.rs         # Market discovery and matching
+├── cache.rs             # Team code mapping cache
+├── kalshi.rs            # Kalshi platform integration
+├── polymarket.rs        # Polymarket WebSocket client
+├── polymarket_clob.rs   # Polymarket CLOB order execution
+├── telegram.rs          # Telegram bot control interface
+├── notifications.rs     # Pushover alert system
+├── status_cache.rs      # Lock-free status cache
+└── config.rs            # League configurations and thresholds
 ```
 
 ### Security Best Practices
@@ -231,6 +258,61 @@ impl Config {
 }
 ```
 
+### Sidecar Architecture
+- Implement monitoring and control as concurrent "sidecar" tasks
+- Never block the trading loop with network I/O or locks
+- Use message-passing (mpsc channels) for notifications
+- Update status caches atomically via ArcSwap
+- Handle shutdown via broadcast channels
+- Example sidecar pattern:
+```rust
+// Trading loop: only try_send() and update cache
+let _ = notification_tx.send(AlertMessage::ArbExecuted { ... });
+status_cache.store(Arc::new(updated_summary));
+
+// Sidecar: processes alerts without blocking trading
+tokio::spawn(notification_worker(rx, http_client));
+```
+
+### Notification Patterns
+- Use `mpsc::UnboundedSender` for alerts (trading loop never blocks)
+- Implement dedicated worker tasks for external API calls
+- Share `Arc<reqwest::Client>` between notification systems
+- Fire-and-forget for alerts; don't wait for delivery confirmation
+- Example:
+```rust
+// In execution engine
+let _ = self.notification_tx.send(AlertMessage::ArbExecuted {
+    profit: actual_profit as f64 / 100.0,
+    market: pair.description.to_string(),
+    timestamp: self.clock.now_ns(),
+});
+
+// Worker processes without blocking
+async fn notification_worker(mut rx: mpsc::UnboundedReceiver<AlertMessage>) {
+    while let Some(alert) = rx.recv().await {
+        send_pushover_alert(&alert).await; // Non-blocking to trading
+    }
+}
+```
+
+### Control Interface Guidelines
+- Restrict access to authorized users only (admin chat ID)
+- Use secure token handling; never log credentials
+- Implement rate limiting and input validation
+- Provide immediate feedback for commands
+- Example Telegram handler:
+```rust
+pub async fn run_telegram_handler(
+    bot_token: String,
+    admin_chat_id: String,
+    status_cache: StatusCache,
+    shutdown_tx: broadcast::Sender<()>,
+) -> Result<()> {
+    // Restrict to admin only, handle /status, /stop commands
+}
+```
+
 ### Dependencies
 - Minimize external dependencies
 - Prefer well-maintained crates from crates.io
@@ -243,5 +325,7 @@ impl Config {
   - `tracing`: Logging
   - `reqwest`: HTTP client
   - `tokio-tungstenite`: WebSocket client
+  - `teloxide`: Telegram bot framework
+  - `arc-swap`: Lock-free atomic updates
 
 Follow these guidelines to maintain code quality, performance, and consistency across the arbitrage bot codebase.
