@@ -1,5 +1,5 @@
 # --- STAGE 1: Build & Cache Warming ---
-FROM rust:1.75-slim-bookworm AS builder
+FROM rust:latest AS builder
 
 # Install system dependencies for Rust and Python
 RUN apt-get update && apt-get install -y \
