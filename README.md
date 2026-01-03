@@ -2,6 +2,8 @@
 
 **Kalshi-Poly arbitrage bot**, **Poly-Poly arbitrage bot**, and **Kalshi-Kalshi arbitrage bot** for automated cross-platform trading. A high-performance, production-ready arbitrage trading system that monitors price discrepancies between Kalshi and Polymarket, executing risk-free arbitrage opportunities in real-time with sub-millisecond latency.
 
+**Features:** Telegram bot control, Pushover alerts, emergency shutdown, real-time status monitoring, and lock-free concurrent architecture.
+
 > 🔍 **Search Keywords**: polymarket arbitrage bot, polymarket-kalshi arbitrage bot, kalshi-poly arbitrage, poly-poly arbitrage, kalshi-kalshi arbitrage, kalshi arbitrage, prediction market arbitrage, cross-platform trading bot
 
 ## Overview
@@ -77,6 +79,12 @@ POLY_FUNDER=0xYOUR_WALLET_ADDRESS
 # === SYSTEM CONFIGURATION ===
 DRY_RUN=1
 RUST_LOG=info
+
+# === MONITORING & CONTROL ===
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+ADMIN_CHAT_ID=your_telegram_user_id
+PUSHOVER_TOKEN=your_pushover_app_token
+PUSHOVER_USER_KEY=your_pushover_user_key
 ```
 
 ### 3. Run
@@ -89,7 +97,41 @@ dotenvx run -- cargo run --release
 DRY_RUN=0 dotenvx run -- cargo run --release
 ```
 
+### 4. Monitoring & Control
+
+The bot includes built-in Telegram control and Pushover alerts for real-time monitoring.
+
+#### Telegram Bot Control
+
+Send commands directly to your bot via Telegram:
+
+- **`/status`** - View current P&L, open positions, last trade, and mode
+- **`/stop`** - Emergency halt with order cancellation and system shutdown
+- **`/help`** - Show available commands
+
+**Setup:**
+1. Create a bot with [@BotFather](https://t.me/botfather)
+2. Get your chat ID using [@userinfobot](https://t.me/userinfobot)
+3. Set `TELEGRAM_BOT_TOKEN` and `ADMIN_CHAT_ID` environment variables
+
+**Security:** Only the admin chat ID can issue commands.
+
+#### Pushover Alerts
+
+Receive instant notifications on your phone for successful arbitrage executions:
+
+- **Format:** "🎯 Arb Executed: $2.40 profit | Chelsea vs Arsenal"
+- **Delivery:** Reliable push notifications via Pushover API
+- **Performance:** Non-blocking, doesn't impact trading speed
+
+**Setup:**
+1. Create account at [pushover.net](https://pushover.net)
+2. Create an application to get `PUSHOVER_TOKEN`
+3. Use your user key as `PUSHOVER_USER_KEY`
+
 ---
+
+## Environment Variables
 
 ## Environment Variables
 
@@ -101,6 +143,10 @@ DRY_RUN=0 dotenvx run -- cargo run --release
 | `KALSHI_PRIVATE_KEY_PATH` | Path to RSA private key (PEM format) for Kalshi API signing |
 | `POLY_PRIVATE_KEY`        | Ethereum private key (with 0x prefix) for Polymarket wallet |
 | `POLY_FUNDER`             | Your Polymarket wallet address (with 0x prefix)             |
+| `TELEGRAM_BOT_TOKEN`      | Telegram bot token from @BotFather                          |
+| `ADMIN_CHAT_ID`           | Your Telegram user ID for bot control                       |
+| `PUSHOVER_TOKEN`          | Pushover app token for alerts                               |
+| `PUSHOVER_USER_KEY`       | Pushover user key for receiving alerts                      |
 
 ### System Configuration
 
@@ -240,6 +286,9 @@ src/
 ├── kalshi.rs            # Kalshi REST API and WebSocket client
 ├── polymarket.rs        # Polymarket WebSocket client and market data
 ├── polymarket_clob.rs   # Polymarket CLOB order execution client
+├── telegram.rs          # Telegram bot control interface
+├── notifications.rs     # Pushover alert system
+├── status_cache.rs      # Lock-free status cache
 └── config.rs            # League configurations and system thresholds
 ```
 
@@ -250,6 +299,9 @@ src/
 - **Concurrent order execution** with automatic position reconciliation
 - **Circuit breaker protection** with configurable risk limits
 - **Intelligent market discovery** with caching and incremental updates
+- **Telegram bot control** for real-time monitoring and emergency shutdown
+- **Pushover alerts** for instant arbitrage execution notifications
+- **Broadcast shutdown system** for reliable emergency halts
 
 ---
 
@@ -281,6 +333,10 @@ For Railway deployment:
    - `KALSHI_PRIVATE_KEY_PATH`: Path to RSA private key (or provide via env if adapted)
    - `DRY_RUN`: Set to `0` for live trading, `1` for paper trading
    - `RUST_LOG`: Set to `arb_bot=info` for production logging
+   - `TELEGRAM_BOT_TOKEN`: Telegram bot token from @BotFather
+   - `ADMIN_CHAT_ID`: Your Telegram user ID for bot control
+   - `PUSHOVER_TOKEN`: Pushover app token for alerts
+   - `PUSHOVER_USER_KEY`: Pushover user key for receiving alerts
 3. **Service Settings**: Disable TCP health checks since this is a headless execution engine.
 4. **Resource Allocation**: Ensure adequate CPU and memory for WebSocket monitoring.
 
@@ -322,10 +378,10 @@ cargo bench
 - [x] Real-time position and P&L tracking
 - [x] Circuit breaker with configurable risk limits
 - [x] Intelligent market discovery with caching
-- [x] Automatic exposure management for mismatched fills
-
-### 🚧 Future Enhancements
-
+- [x] Telegram bot control for emergency management
+- [x] Pushover alerts for arbitrage execution notifications
+- [x] Broadcast shutdown system for reliable emergency halts
+- [x] Lock-free status cache for real-time monitoring
 - [ ] Web-based risk limit configuration UI
 - [ ] Multi-account support for portfolio management
 - [ ] Advanced order routing strategies
