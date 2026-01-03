@@ -253,6 +253,41 @@ src/
 
 ---
 
+## Deployment
+
+### Docker
+
+The bot includes a multi-stage Dockerfile optimized for production deployment.
+
+```bash
+# Build the Docker image
+docker build -t arbitrage-bot .
+
+# Run in dry-run mode (recommended for testing)
+docker run -e DRY_RUN=1 -e RUST_LOG=info arbitrage-bot
+
+# Run live (ensure environment variables are set)
+docker run -e DRY_RUN=0 -e KALSHI_API_KEY_ID=... -e POLY_PRIVATE_KEY=... arbitrage-bot
+```
+
+### Railway
+
+For Railway deployment:
+
+1. **Deploy the code**: Push this repository to GitHub and connect it to Railway.
+2. **Environment Variables**: Set the following in Railway's Variables tab:
+   - `POLY_PRIVATE_KEY`: Your Polymarket wallet private key (with 0x prefix)
+   - `KALSHI_API_KEY_ID`: Your Kalshi API key ID
+   - `KALSHI_PRIVATE_KEY_PATH`: Path to RSA private key (or provide via env if adapted)
+   - `DRY_RUN`: Set to `0` for live trading, `1` for paper trading
+   - `RUST_LOG`: Set to `arb_bot=info` for production logging
+3. **Service Settings**: Disable TCP health checks since this is a headless execution engine.
+4. **Resource Allocation**: Ensure adequate CPU and memory for WebSocket monitoring.
+
+The Dockerfile automatically warms the Polymarket sports cache during build, ensuring the bot starts with market mappings ready.
+
+---
+
 ## Development
 
 ### Run Tests
