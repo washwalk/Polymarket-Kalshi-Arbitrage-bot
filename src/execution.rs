@@ -13,7 +13,7 @@ use tracing::{info, warn, error};
 use crate::kalshi::KalshiApiClient;
 use crate::polymarket_clob::SharedAsyncClient;
 use crate::types::{
-    ArbType, MarketPair,
+    AlertMessage, ArbType, MarketPair, PositionSummary, StatusCache,
     FastExecutionRequest, GlobalState,
     cents_to_price,
 };
@@ -53,6 +53,8 @@ pub struct ExecutionEngine {
     state: Arc<GlobalState>,
     circuit_breaker: Arc<CircuitBreaker>,
     position_channel: PositionChannel,
+    notification_tx: mpsc::UnboundedSender<AlertMessage>,
+    status_cache: StatusCache,
     in_flight: Arc<[AtomicU64; 8]>,
     clock: NanoClock,
     pub dry_run: bool,
@@ -66,6 +68,8 @@ impl ExecutionEngine {
         state: Arc<GlobalState>,
         circuit_breaker: Arc<CircuitBreaker>,
         position_channel: PositionChannel,
+        notification_tx: mpsc::UnboundedSender<AlertMessage>,
+        status_cache: StatusCache,
         dry_run: bool,
     ) -> Self {
         let test_mode = std::env::var("TEST_ARB")
@@ -78,6 +82,8 @@ impl ExecutionEngine {
             state,
             circuit_breaker,
             position_channel,
+            notification_tx,
+            status_cache,
             in_flight: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             clock: NanoClock::new(),
             dry_run,
@@ -243,6 +249,24 @@ impl ExecutionEngine {
 
                 if success {
                     self.circuit_breaker.record_success(&pair.pair_id, matched, matched, actual_profit as f64 / 100.0).await;
+
+                    // Send execution alert
+                    let _ = self.notification_tx.send(AlertMessage::ArbExecuted {
+                        profit: actual_profit as f64 / 100.0,
+                        market: pair.description.to_string(),
+                        timestamp: self.clock.now_ns(),
+                    });
+
+                    // Update status cache immediately
+                    let current = self.status_cache.load();
+                    let new_summary = Arc::new(PositionSummary {
+                        realized_pnl: current.realized_pnl + actual_profit as f64 / 100.0,
+                        open_positions: current.open_positions, // This would need to be calculated properly
+                        last_trade_profit: actual_profit as f64 / 100.0,
+                        last_execution_time: self.clock.now_ns() / 1_000_000_000, // Convert to seconds
+                        dry_run: self.dry_run,
+                    });
+                    self.status_cache.store(new_summary);
                 }
 
                 if matched > 0 {

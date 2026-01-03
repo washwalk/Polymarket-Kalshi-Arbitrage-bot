@@ -32,6 +32,9 @@ mod polymarket;
 mod polymarket_clob;
 mod position_tracker;
 mod types;
+mod notifications;
+mod status_cache;
+mod telegram;
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -44,9 +47,11 @@ use config::{ARB_THRESHOLD, ENABLED_LEAGUES, WS_RECONNECT_DELAY_SECS};
 use discovery::DiscoveryClient;
 use execution::{ExecutionEngine, create_execution_channel, run_execution_loop};
 use kalshi::{KalshiConfig, KalshiApiClient};
+use notifications::NotificationManager;
 use polymarket_clob::{PolymarketAsyncClient, PreparedCreds, SharedAsyncClient};
 use position_tracker::{PositionTracker, create_position_channel, position_writer_loop};
-use types::{GlobalState, PriceCents};
+use telegram::run_telegram_handler;
+use types::{GlobalState, PositionSummary, PriceCents, StatusCache};
 
 /// Polymarket CLOB API host
 const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
@@ -173,7 +178,59 @@ async fn main() -> Result<()> {
     let position_tracker = Arc::new(RwLock::new(PositionTracker::new()));
     let (position_channel, position_rx) = create_position_channel();
 
-    tokio::spawn(position_writer_loop(position_rx, position_tracker));
+    tokio::spawn(position_writer_loop(position_rx, position_tracker.clone()));
+
+    // Initialize status cache for lock-free status reads
+    let status_cache = Arc::new(arc_swap::ArcSwap::new(Arc::new(PositionSummary {
+        realized_pnl: 0.0,
+        open_positions: 0,
+        last_trade_profit: 0.0,
+        last_execution_time: 0,
+        dry_run,
+    })));
+
+    // Initialize shared HTTP client for notifications and telegram
+    let http_client = Arc::new(reqwest::Client::new());
+
+    // Load notification credentials
+    let pushover_token = std::env::var("PUSHOVER_TOKEN")
+        .context("PUSHOVER_TOKEN not set")?;
+    let pushover_user_key = std::env::var("PUSHOVER_USER_KEY")
+        .context("PUSHOVER_USER_KEY not set")?;
+
+    // Initialize notification manager
+    let notification_manager = Arc::new(NotificationManager::new(
+        pushover_token,
+        pushover_user_key,
+        http_client.clone(),
+    ));
+
+    // Initialize shutdown broadcast channel
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+
+    // Load Telegram credentials
+    let telegram_token = std::env::var("TELEGRAM_BOT_TOKEN")
+        .context("TELEGRAM_BOT_TOKEN not set")?;
+    let admin_chat_id = std::env::var("ADMIN_CHAT_ID")
+        .context("ADMIN_CHAT_ID not set")?;
+
+    // Spawn Telegram control interface
+    let telegram_status_cache = status_cache.clone();
+    let telegram_shutdown_tx = shutdown_tx.clone();
+    let telegram_kalshi = kalshi_api.clone();
+    let telegram_poly = poly_async.clone();
+    let telegram_handle = tokio::spawn(async move {
+        if let Err(e) = run_telegram_handler(
+            telegram_token,
+            admin_chat_id,
+            telegram_status_cache,
+            telegram_shutdown_tx,
+            telegram_kalshi,
+            telegram_poly,
+        ).await {
+            error!("Telegram handler failed: {}", e);
+        }
+    });
 
     let threshold_cents: PriceCents = ((ARB_THRESHOLD * 100.0).round() as u16).max(1);
     info!("   Execution threshold: {} cents", threshold_cents);
@@ -184,6 +241,8 @@ async fn main() -> Result<()> {
         state.clone(),
         circuit_breaker.clone(),
         position_channel,
+        notification_manager.sender.clone(),
+        status_cache.clone(),
         dry_run,
     ));
 
@@ -264,10 +323,19 @@ async fn main() -> Result<()> {
     let kalshi_exec_tx = exec_tx.clone();
     let kalshi_threshold = threshold_cents;
     let kalshi_ws_config = KalshiConfig::from_env()?;
+    let mut kalshi_shutdown_rx = shutdown_tx.subscribe();
     let kalshi_handle = tokio::spawn(async move {
         loop {
-            if let Err(e) = kalshi::run_ws(&kalshi_ws_config, kalshi_state.clone(), kalshi_exec_tx.clone(), kalshi_threshold).await {
-                error!("[KALSHI] WebSocket disconnected: {} - reconnecting...", e);
+            tokio::select! {
+                result = kalshi::run_ws(&kalshi_ws_config, kalshi_state.clone(), kalshi_exec_tx.clone(), kalshi_threshold) => {
+                    if let Err(e) = result {
+                        error!("[KALSHI] WebSocket disconnected: {} - reconnecting...", e);
+                    }
+                }
+                _ = kalshi_shutdown_rx.recv() => {
+                    info!("[KALSHI] Shutdown signal received");
+                    break;
+                }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
         }
@@ -277,10 +345,19 @@ async fn main() -> Result<()> {
     let poly_state = state.clone();
     let poly_exec_tx = exec_tx.clone();
     let poly_threshold = threshold_cents;
+    let mut poly_shutdown_rx = shutdown_tx.subscribe();
     let poly_handle = tokio::spawn(async move {
         loop {
-            if let Err(e) = polymarket::run_ws(poly_state.clone(), poly_exec_tx.clone(), poly_threshold).await {
-                error!("[POLYMARKET] WebSocket disconnected: {} - reconnecting...", e);
+            tokio::select! {
+                result = polymarket::run_ws(poly_state.clone(), poly_exec_tx.clone(), poly_threshold) => {
+                    if let Err(e) = result {
+                        error!("[POLYMARKET] WebSocket disconnected: {} - reconnecting...", e);
+                    }
+                }
+                _ = poly_shutdown_rx.recv() => {
+                    info!("[POLYMARKET] Shutdown signal received");
+                    break;
+                }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
         }
@@ -289,11 +366,18 @@ async fn main() -> Result<()> {
     // System health monitoring and arbitrage diagnostics
     let heartbeat_state = state.clone();
     let heartbeat_threshold = threshold_cents;
+    let mut heartbeat_shutdown_rx = shutdown_tx.subscribe();
     let heartbeat_handle = tokio::spawn(async move {
         use crate::types::kalshi_fee_cents;
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = heartbeat_shutdown_rx.recv() => {
+                    info!("Heartbeat shutdown signal received");
+                    break;
+                }
+            }
             let market_count = heartbeat_state.market_count();
             let mut with_kalshi = 0;
             let mut with_poly = 0;
@@ -358,7 +442,7 @@ async fn main() -> Result<()> {
 
     // Main event loop - run until termination
     info!("✅ All systems operational - entering main event loop");
-    let _ = tokio::join!(kalshi_handle, poly_handle, heartbeat_handle, exec_handle);
+    let _ = tokio::join!(kalshi_handle, poly_handle, heartbeat_handle, exec_handle, telegram_handle);
 
     Ok(())
 }
